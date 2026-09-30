@@ -200,13 +200,24 @@ def wait_for_bootloader(client):
     original_timeout = client.timeout
     client.timeout = min(original_timeout, 0.5)
     try:
-        info = client.info()
+        return client.info()
     except Exception:
-        input("未检测到 bootloader。请复位设备，并在 %d 秒内按回车继续... " % (BOOT_WAIT_MS // 1000))
-        info = client.info()
+        client.timeout = original_timeout
+        input("未检测到 bootloader。现在复位设备，并立即按回车开始探测... ")
+
+    deadline = time.monotonic() + BOOT_WAIT_MS / 1000.0
+    last_error = None
+    try:
+        while time.monotonic() < deadline:
+            client.timeout = min(original_timeout, 0.25)
+            try:
+                return client.info()
+            except Exception as error:
+                last_error = error
+                time.sleep(0.05)
+        raise TimeoutError("复位后未在 bootloader 等待窗口内收到 INFO 响应: %s" % last_error)
     finally:
         client.timeout = original_timeout
-    return info
 
 
 def upgrade(args):

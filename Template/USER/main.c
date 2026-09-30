@@ -26,6 +26,11 @@ int main(void)
 
     nvic_priority_group_set(NVIC_PRIGROUP_PRE3_SUB1);
     SystemInit();
+
+    rcu_periph_clock_enable(RCU_GPIOB);
+    gpio_bit_reset(GPIOB, GPIO_PIN_8 | GPIO_PIN_9);
+    gpio_init(GPIOB, GPIO_MODE_OUT_PP, GPIO_OSPEED_2MHZ, GPIO_PIN_8 | GPIO_PIN_9);
+
     systick_config();
 
     /* LED + 485 方向控制引脚初始化 */
