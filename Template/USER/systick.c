@@ -36,7 +36,7 @@ OF SUCH DAMAGE.
 #include "systick.h"
 
 volatile static uint32_t delay;
-/* 1ms 自由运行节拍计数，供 485 发送方向看门狗等超时检测使用 */
+/* 1ms 自由运行节拍计数 */
 volatile static uint32_t systick_ms = 0;
 
 /*!

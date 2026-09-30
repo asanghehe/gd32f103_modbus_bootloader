@@ -1,6 +1,6 @@
 /*!
     \file    bootloader.c
-    \brief   RS485 (Modbus RTU) bootloader 核心实现:
+    \brief   RS485 simple-frame bootloader 核心实现:
              flash 擦写 / CRC32 / APP 有效性检查 / 跳转 APP
 
     \version V1.0.0
@@ -9,8 +9,7 @@
 #include "bootloader.h"
 #include "systick.h"
 #include "bsp_usart.h"
-#include "bsp_TiMbase.h"
-#include "mb.h"
+#include "gd32f10x_libopt.h"
 
 #include "bsp_led.h"
 
@@ -18,9 +17,22 @@
 static bool     s_bUpdating  = 0;    /* 升级模式标志               */
 static bool     s_bErased    = 0;    /* APP 区已擦除               */
 static bool     s_bCmdOk     = 0;    /* 上次命令执行成功           */
-static uint8_t  s_ucCrcRes   = BOOT_CRC_NOT_RUN;
 static boot_err_t s_eErr     = BOOT_ERR_NONE;
 static bool     s_bAppValid  = 0;
+static uint32_t s_ulFwSize   = 0U;
+static uint32_t s_ulFwCrc    = 0U;
+
+#define BOOT_META_MAGIC      0x424F4F54UL
+
+typedef struct
+{
+    uint32_t magic;
+    uint32_t size;
+    uint32_t crc;
+    uint32_t magic_inv;
+    uint32_t size_inv;
+    uint32_t crc_inv;
+} boot_meta_t;
 
 /* ---------------- flash 基本操作 ---------------- */
 
@@ -31,10 +43,14 @@ static void flash_unlock_clear(void)
     fmc_flag_clear(FMC_FLAG_BANK0_PGERR | FMC_FLAG_BANK0_WPERR | FMC_FLAG_BANK0_END);
 }
 
-bool boot_app_is_valid(void)
+static bool boot_vector_is_valid(uint32_t fw_size)
 {
     uint32_t sp = *(volatile uint32_t *)APP_START_ADDR;
     uint32_t pc = *(volatile uint32_t *)(APP_START_ADDR + 4U);
+
+    if ((fw_size < 8UL) || (fw_size > APP_MAX_SIZE)){
+        return 0;
+    }
 
     /* 空 flash (0xFFFFFFFF) 直接无效 */
     if ((sp == 0xFFFFFFFFUL) || (pc == 0xFFFFFFFFUL)){
@@ -50,7 +66,7 @@ bool boot_app_is_valid(void)
     }
 
     /* PC: 必须落在 APP flash 区, 且为 Thumb 地址 (bit0 = 1) */
-    if ((pc < APP_START_ADDR) || (pc >= (APP_START_ADDR + APP_MAX_SIZE))){
+    if ((pc < APP_START_ADDR) || (pc >= (APP_START_ADDR + fw_size))){
         return 0;
     }
     if ((pc & 0x1UL) == 0UL){
@@ -60,14 +76,76 @@ bool boot_app_is_valid(void)
     return 1;
 }
 
+static bool boot_app_verify(void)
+{
+    const boot_meta_t *meta = (const boot_meta_t *)BOOT_META_ADDR;
+
+    if ((meta->magic != BOOT_META_MAGIC) ||
+        (meta->magic_inv != ~BOOT_META_MAGIC) ||
+        (meta->size == 0UL) || (meta->size > APP_MAX_SIZE) ||
+        (meta->size_inv != ~meta->size) ||
+        (meta->crc_inv != ~meta->crc)){
+        return 0;
+    }
+    if (!boot_vector_is_valid(meta->size)){
+        return 0;
+    }
+
+    return (boot_crc32((const uint8_t *)APP_START_ADDR, meta->size) == meta->crc);
+}
+
+static bool boot_meta_write(uint32_t fw_size, uint32_t fw_crc)
+{
+    boot_meta_t meta;
+    uint32_t words[6];
+    uint32_t index;
+    fmc_state_enum state = FMC_READY;
+
+    meta.magic = BOOT_META_MAGIC;
+    meta.size = fw_size;
+    meta.crc = fw_crc;
+    meta.magic_inv = ~BOOT_META_MAGIC;
+    meta.size_inv = ~fw_size;
+    meta.crc_inv = ~fw_crc;
+    words[0] = meta.magic;
+    words[1] = meta.size;
+    words[2] = meta.crc;
+    words[3] = meta.magic_inv;
+    words[4] = meta.size_inv;
+    words[5] = meta.crc_inv;
+
+    flash_unlock_clear();
+    for (index = 0U; index < 12U; index++){
+        uint16_t halfword = (uint16_t)(words[index / 2U] >> ((index & 1U) * 16U));
+        state = fmc_halfword_program(BOOT_META_ADDR + index * 2U, halfword);
+        if (state != FMC_READY){
+            break;
+        }
+    }
+    fmc_lock();
+
+    return (state == FMC_READY);
+}
+
+bool boot_app_is_valid(void)
+{
+    return s_bAppValid;
+}
+
 void boot_init(void)
 {
     s_bUpdating = 0;                 /* 每次上电/复位都清零, 不依赖 .bss 清零 */
     s_bErased   = 0;
     s_bCmdOk    = 0;
-    s_ucCrcRes  = BOOT_CRC_NOT_RUN;
     s_eErr      = BOOT_ERR_NONE;
-    s_bAppValid = boot_app_is_valid();
+    s_ulFwSize  = 0U;
+    s_ulFwCrc   = 0U;
+    s_bAppValid = boot_app_verify();
+    if (s_bAppValid){
+        const boot_meta_t *meta = (const boot_meta_t *)BOOT_META_ADDR;
+        s_ulFwSize = meta->size;
+        s_ulFwCrc  = meta->crc;
+    }
 }
 
 bool boot_is_updating(void)
@@ -105,44 +183,44 @@ void boot_set_error(boot_err_t err)
 
 /* ---------------- 命令实现 ---------------- */
 
-void boot_cmd_enter_update(void)
+bool boot_cmd_begin_update(uint32_t fw_size, uint32_t crc32)
 {
-    s_bUpdating = 1;
-    s_bCmdOk    = 1;
-    s_eErr      = BOOT_ERR_NONE;
-}
+    uint32_t page_count;
+    uint32_t address;
+    fmc_state_enum state;
 
-/*! 按固件大小擦除 APP 区 (每页擦除期间喂狗, 防止看门狗复位) */
-bool boot_cmd_erase(uint32_t fw_size)
-{
-    uint32_t page_cnt;
-    uint32_t addr;
-    fmc_state_enum st = FMC_READY;
-
-    if (!s_bUpdating){
-        boot_set_error(BOOT_ERR_NOT_UPDATE);
-        return 0;
-    }
     if ((fw_size == 0UL) || (fw_size > APP_MAX_SIZE)){
         boot_set_error(BOOT_ERR_BAD_SIZE);
         return 0;
     }
 
-    page_cnt = (fw_size + 2047UL) / 2048UL;          /* 2KB / 页 */
-    addr     = APP_START_ADDR;
+    s_bUpdating = 1;
+    s_bErased = 0;
+    s_bAppValid = 0;
+    s_ulFwSize = fw_size;
+    s_ulFwCrc = crc32;
 
     flash_unlock_clear();
-    while (page_cnt-- > 0U){
-        st = fmc_page_erase(addr);
-        if (FMC_READY != st){
+    state = fmc_page_erase(BOOT_META_ADDR);
+    fmc_lock();
+    if (state != FMC_READY){
+        boot_set_error(BOOT_ERR_NO_ERASE);
+        return 0;
+    }
+
+    page_count = (fw_size + BOOT_FLASH_PAGE_SIZE - 1UL) / BOOT_FLASH_PAGE_SIZE;
+    address = APP_START_ADDR;
+    flash_unlock_clear();
+    while (page_count-- > 0U){
+        state = fmc_page_erase(address);
+        if (state != FMC_READY){
             break;
         }
-        addr += 2048UL;
-        fwdgt_counter_reload();                      /* 擦除耗时长, 逐页喂狗 */
+        address += BOOT_FLASH_PAGE_SIZE;
     }
     fmc_lock();
 
-    if (FMC_READY != st){
+    if (state != FMC_READY){
         boot_set_error(BOOT_ERR_NO_ERASE);
         return 0;
     }
@@ -153,10 +231,11 @@ bool boot_cmd_erase(uint32_t fw_size)
     return 1;
 }
 
-/*! 写 APP flash: 半字对齐编程, len 必须为偶数 */
-bool boot_cmd_write(uint32_t flash_addr, const uint8_t *data, uint16_t len)
+/*! 写 APP flash: 半字对齐编程, 奇数字节仅允许出现在最后一块 */
+bool boot_cmd_write(uint32_t offset, const uint8_t *data, uint16_t len)
 {
-    fmc_state_enum st = FMC_READY;
+    uint16_t index = 0U;
+    fmc_state_enum state = FMC_READY;
 
     if (!s_bUpdating){
         boot_set_error(BOOT_ERR_NOT_UPDATE);
@@ -166,28 +245,34 @@ bool boot_cmd_write(uint32_t flash_addr, const uint8_t *data, uint16_t len)
         boot_set_error(BOOT_ERR_NOT_ERASED);
         return 0;
     }
-    /* 地址范围与半字对齐检查 */
-    if ((flash_addr < APP_START_ADDR) ||
-        ((flash_addr + len) > (APP_START_ADDR + APP_MAX_SIZE)) ||
-        (flash_addr & 0x1UL) || (len & 0x1UL)){
+    if ((len == 0U) || (offset > s_ulFwSize) ||
+        ((uint32_t)len > (s_ulFwSize - offset)) || (offset & 1UL) ||
+        ((len & 1U) && ((uint32_t)len != (s_ulFwSize - offset)))){
         boot_set_error(BOOT_ERR_BAD_ADDR);
         return 0;
     }
 
     flash_unlock_clear();
-    while (len > 0U){
-        uint16_t half = (uint16_t)data[0] | ((uint16_t)data[1] << 8);
-        st = fmc_halfword_program(flash_addr, half);
-        if (FMC_READY != st){
+    while (index < len){
+        uint16_t half = data[index];
+        if ((uint16_t)(index + 1U) < len){
+            half |= (uint16_t)data[index + 1U] << 8;
+        }else{
+            half |= 0xFF00U;
+        }
+        if (*(volatile uint16_t *)(APP_START_ADDR + offset + index) == half){
+            index += 2U;
+            continue;
+        }
+        state = fmc_halfword_program(APP_START_ADDR + offset + index, half);
+        if (state != FMC_READY){
             break;
         }
-        flash_addr += 2U;
-        data       += 2;
-        len        -= 2U;
+        index += 2U;
     }
     fmc_lock();
 
-    if (FMC_READY != st){
+    if (state != FMC_READY){
         boot_set_error(BOOT_ERR_FLASH);
         return 0;
     }
@@ -197,34 +282,36 @@ bool boot_cmd_write(uint32_t flash_addr, const uint8_t *data, uint16_t len)
     return 1;
 }
 
-/*! 对 APP 区前 fw_size 字节计算 CRC32 并与给定值比对 */
-bool boot_cmd_check_crc(uint32_t fw_size, uint32_t crc32)
+/*! 校验 APP 镜像并提交可启动元数据 */
+bool boot_cmd_check_crc(void)
 {
-    uint32_t crc;
-
     if (!s_bUpdating){
         boot_set_error(BOOT_ERR_NOT_UPDATE);
-        s_ucCrcRes = BOOT_CRC_FAIL;
         return 0;
     }
-    if ((fw_size == 0UL) || (fw_size > APP_MAX_SIZE)){
+    if ((s_ulFwSize == 0UL) || (s_ulFwSize > APP_MAX_SIZE)){
         boot_set_error(BOOT_ERR_BAD_SIZE);
-        s_ucCrcRes = BOOT_CRC_FAIL;
+        return 0;
+    }
+    if (!boot_vector_is_valid(s_ulFwSize)){
+        boot_set_error(BOOT_ERR_APP_INVALID);
         return 0;
     }
 
-    crc = boot_crc32((const uint8_t *)APP_START_ADDR, fw_size);
-
-    if (crc == crc32){
-        s_ucCrcRes = BOOT_CRC_PASS;
-        s_bCmdOk   = 1;
-        s_eErr     = BOOT_ERR_NONE;
-        return 1;
+    if (boot_crc32((const uint8_t *)APP_START_ADDR, s_ulFwSize) != s_ulFwCrc){
+        boot_set_error(BOOT_ERR_CRC_FAIL);
+        return 0;
     }
 
-    s_ucCrcRes = BOOT_CRC_FAIL;
-    boot_set_error(BOOT_ERR_CRC_FAIL);
-    return 0;
+    if (!boot_meta_write(s_ulFwSize, s_ulFwCrc)){
+        boot_set_error(BOOT_ERR_FLASH);
+        return 0;
+    }
+
+    s_bAppValid = 1;
+    s_bCmdOk = 1;
+    s_eErr = BOOT_ERR_NONE;
+    return 1;
 }
 
 /* ---------------- 复位/跳转 ---------------- */
@@ -242,14 +329,8 @@ static void deinit_all(void)
 
     __disable_irq();
 
-    /* 停止 Modbus 协议栈并复位串口/DMA/定时器 */
-    (void)eMBDisable();
-
+    /* 复位轮询 UART */
     usart_deinit(COM_PORT);
-    dma_deinit(DMA_DEVICE, USART_TX_DMA_CHANNEL);
-    dma_deinit(DMA_DEVICE, USART_RX_DMA_CHANNEL);
-    timer_deinit(BASIC_TIM);
-    timer_deinit(DELAY_TIM);
 
     /* 关闭所有 NVIC 中断使能并清 pending */
     for (i = 0U; i < 8U; i++){
@@ -260,8 +341,8 @@ static void deinit_all(void)
     SysTick->CTRL = 0U;
     SCB->VTOR     = APP_START_ADDR;  /* 原来 0U, 改成 APP 基址 */
 
-    /* 485 切回接收方向 (PB7 输出低, 与 portserial.c 中 LED_485_ON 一致) */
-    gpio_bit_reset(GPIOB, GPIO_PIN_7);
+    /* 485 切回接收方向 */
+    LED_485_ON;
 }
 
 bool boot_jump_to_app(void)
@@ -270,13 +351,15 @@ bool boot_jump_to_app(void)
 	  volatile uint32_t i = 0;
     void   (*pReset)(void);
 
-    if (!boot_app_is_valid()){
+    if (!boot_app_verify()){
+        s_bAppValid = 0;
         boot_set_error(BOOT_ERR_APP_INVALID);
         return 0;
     }
 
     sp = *(volatile uint32_t *)APP_START_ADDR;
     pc = *(volatile uint32_t *)(APP_START_ADDR + 4U);
+    s_bAppValid = 1;
     
 		/* ---- 调试标记: LED 常亮 2 秒, 明显区别于 250ms 心跳 ---- */
     LED_COM_ON;
@@ -296,12 +379,17 @@ bool boot_jump_to_app(void)
 
 /* ---------------- 工具 ---------------- */
 
-uint8_t boot_crc_result_get(void)   /* 供 user_mb_app.c 读取 HR7 */
+uint32_t boot_get_app_size(void)
 {
-    return s_ucCrcRes;
+    return s_ulFwSize;
 }
 
-boot_err_t boot_error_get(void)     /* 供 user_mb_app.c 读取 HR8 */
+uint32_t boot_get_app_crc(void)
+{
+    return s_ulFwCrc;
+}
+
+boot_err_t boot_get_error(void)
 {
     return s_eErr;
 }

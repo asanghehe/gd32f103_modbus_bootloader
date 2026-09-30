@@ -39,9 +39,6 @@ OF SUCH DAMAGE.
 #include "gd32f10x_pmu.h"
 #include "gd32f10x_rcu.h"
 #include "gd32f10x_gpio.h"
-#include "gd32f10x_dma.h"
-#include "gd32f10x_fwdgt.h"
-#include "gd32f10x_timer.h"
 #include "gd32f10x_usart.h"
 #include "gd32f10x_misc.h"
 
